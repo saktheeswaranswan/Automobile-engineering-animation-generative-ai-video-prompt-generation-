@@ -1,0 +1,475 @@
+// ==========================================
+// CONSTANT MESH GEARBOX SIMULATION
+// Advanced Telemetry, Perfect Mesh, Laser Flow & Shift Indicators
+// ==========================================
+
+// --- State Variables ---
+int currentState = 0; // 0:Neutral, 1:Low, 2:Second, 3:Top, 4:Reverse
+int nextState = 0;    // Used to preview where dogs will slide
+boolean isClutchEngaged = true;
+int ENGINE_RPM = 3000;
+
+// --- Kinematic Trackers ---
+float rotIn = 0, rotLay = 0, rotMain = 0;
+float rotG8 = 0, rotG7 = 0, rotG6 = 0, rotIdler = 0;
+
+// Dog clutch physical X-axis positions
+float d1_pos = 13; // Between G7(8) and G6(18)
+float d2_pos = -6; // Between G1(-10) and G8(-2)
+float d1_target = 13;
+float d2_target = -6;
+
+// --- Camera Variables ---
+float camAngleX = PI/8;
+float camAngleY = -PI/6;
+float camDist = 75; 
+
+// --- Shifting Logic ---
+boolean isShifting = false;
+int shiftPhase = 0;
+int shiftTimer = 0;
+
+// --- Power Flow Animation ---
+float flowOffset = 0;
+
+// --- Physics & Geometry Constants ---
+float MOD = 0.45; 
+float LAY_Y = 20.25; 
+
+class GearState {
+  String name;
+  float ratio;
+  float t_d1, t_d2; 
+  ArrayList<PVector> flowPath;
+  String pathText;
+  String charText; 
+  String desc; 
+  
+  GearState(String n, float r, float td1, float td2, String pt, String ct, String d) {
+    name = n; ratio = r; t_d1 = td1; t_d2 = td2;
+    pathText = pt; charText = ct; desc = d;
+    flowPath = new ArrayList<PVector>();
+  }
+}
+
+GearState[] gears = new GearState[5];
+
+void setup() {
+  size(displayWidth, displayHeight, P3D);
+  orientation(LANDSCAPE); 
+  smooth(4);
+  initMechanics();
+}
+
+void draw() {
+  background(12, 15, 20);
+  updateKinematics();
+  handleShifting();
+  
+  // ------------------------------------------
+  // TOP SCREEN: 3D Interactive Viewport
+  // ------------------------------------------
+  pushMatrix();
+  clip(0, 0, width, height * 0.55);
+  renderViewport3D(0, 0, width, height * 0.55);
+  noClip();
+  popMatrix();
+  
+  // ------------------------------------------
+  // BOTTOM SCREEN: 2D Telemetry & UI
+  // ------------------------------------------
+  pushMatrix();
+  hint(DISABLE_DEPTH_TEST);
+  camera(); 
+  noLights();
+  renderDashboard(0, height * 0.55, width, height * 0.45);
+  hint(ENABLE_DEPTH_TEST);
+  popMatrix();
+}
+
+// ==========================================
+// INPUT HANDLING
+// ==========================================
+void mousePressed() {
+  if (mouseY > height * 0.55 && !isShifting) {
+    triggerShift();
+  }
+}
+
+void mouseDragged() {
+  if (mouseY < height * 0.55) {
+    camAngleY += (mouseX - pmouseX) * 0.01;
+    camAngleX -= (mouseY - pmouseY) * 0.01;
+  }
+}
+
+// ==========================================
+// KINEMATICS & MECHANICS LOGIC
+// ==========================================
+void initMechanics() {
+  // NEUTRAL
+  gears[0] = new GearState("Neutral", 0, 13, -6, 
+    "Path: Input -> Layshaft -> Disconnected", 
+    "Torque: 0 | Speed: 0", 
+    "Engine drives the lay shaft, but dog clutches are centered. Main spline shaft is completely isolated.");
+  gears[0].flowPath.add(new PVector(-25, 0, 0));
+  gears[0].flowPath.add(new PVector(-10, 0, 0)); 
+  gears[0].flowPath.add(new PVector(-10, 6.75, 0)); 
+  gears[0].flowPath.add(new PVector(-10, LAY_Y, 0)); 
+  
+  // LOW GEAR (1st)
+  gears[1] = new GearState("1st Gear (Low)", 5.5, 9.5, -6, 
+    "Path: G1(15T) -> Layshaft -> G4(12T) -> G7(33T) -> Dog D1", 
+    "Torque: MAXIMUM | Speed: MINIMUM", 
+    "Dog D1 locks G7 to Main Shaft. Highest gear reduction (5.5:1) provides massive torque for starting.");
+  gears[1].flowPath.add(new PVector(-25, 0, 0));
+  gears[1].flowPath.add(new PVector(-10, 0, 0));
+  gears[1].flowPath.add(new PVector(-10, 6.75, 0)); 
+  gears[1].flowPath.add(new PVector(-10, LAY_Y, 0)); 
+  gears[1].flowPath.add(new PVector(8, LAY_Y, 0)); 
+  gears[1].flowPath.add(new PVector(8, LAY_Y - 5.4, 0)); 
+  gears[1].flowPath.add(new PVector(8, 0, 0)); 
+  gears[1].flowPath.add(new PVector(9.5, 0, 0)); 
+  gears[1].flowPath.add(new PVector(25, 0, 0)); 
+
+  // SECOND GEAR
+  gears[2] = new GearState("2nd Gear", 2.5, 13, -3.5, 
+    "Path: G1(15T) -> Layshaft -> G3(20T) -> G8(25T) -> Dog D2", 
+    "Torque: MEDIUM | Speed: MEDIUM", 
+    "Dog D2 locks G8 to Main Shaft. Lower gear reduction ratio provides faster output speed but less torque.");
+  gears[2].flowPath.add(new PVector(-25, 0, 0));
+  gears[2].flowPath.add(new PVector(-10, 0, 0));
+  gears[2].flowPath.add(new PVector(-10, 6.75, 0)); 
+  gears[2].flowPath.add(new PVector(-10, LAY_Y, 0)); 
+  gears[2].flowPath.add(new PVector(-2, LAY_Y, 0)); 
+  gears[2].flowPath.add(new PVector(-2, LAY_Y - 9.0, 0)); 
+  gears[2].flowPath.add(new PVector(-2, 0, 0)); 
+  gears[2].flowPath.add(new PVector(-3.5, 0, 0)); 
+  gears[2].flowPath.add(new PVector(25, 0, 0));
+
+  // TOP GEAR (3rd)
+  gears[3] = new GearState("Top Gear (3rd)", 1.0, 13, -8.5, 
+    "Path: Input Shaft -> Dog Clutch D2 -> Main Shaft", 
+    "Torque: MINIMUM | Speed: MAXIMUM", 
+    "Dog D2 slides left, locking Input Shaft directly to Main Shaft. 1:1 Direct Drive bypasses layshaft.");
+  gears[3].flowPath.add(new PVector(-25, 0, 0));   
+  gears[3].flowPath.add(new PVector(-10, 0, 0));   
+  gears[3].flowPath.add(new PVector(-8.5, 0, 0)); 
+  gears[3].flowPath.add(new PVector(25, 0, 0));    
+
+  // REVERSE GEAR
+  gears[4] = new GearState("Reverse Gear", -4.67, 16.5, -6, 
+    "Path: G1(15T) -> Layshaft -> G5(12T) -> Idler(14T) -> G6(28T)", 
+    "Torque: HIGH | Speed: REVERSE", 
+    "Idler gear between G5 and G6 flips the rotation direction. Dog D1 locks G6 to Main Shaft.");
+  gears[4].flowPath.add(new PVector(-25, 0, 0));
+  gears[4].flowPath.add(new PVector(-10, 0, 0));
+  gears[4].flowPath.add(new PVector(-10, 6.75, 0)); 
+  gears[4].flowPath.add(new PVector(-10, LAY_Y, 0)); 
+  gears[4].flowPath.add(new PVector(18, LAY_Y, 0)); 
+  gears[4].flowPath.add(new PVector(18, 15.56, -10.72)); 
+  gears[4].flowPath.add(new PVector(18, 0, 0)); 
+  gears[4].flowPath.add(new PVector(16.5, 0, 0)); 
+  gears[4].flowPath.add(new PVector(25, 0, 0));
+}
+
+void updateKinematics() {
+  float speedIn = isClutchEngaged ? 0.08 : 0.01;
+  
+  float t_g1 = 15, t_g2 = 30, t_g3 = 20, t_g8 = 25;
+  float t_g4 = 12, t_g7 = 33, t_g5 = 12, t_idler = 14, t_g6 = 28; 
+  
+  float speedLay = speedIn * -(t_g1 / t_g2); 
+  float speedG8 = speedLay * -(t_g3 / t_g8);
+  float speedG7 = speedLay * -(t_g4 / t_g7);
+  float speedIdler = speedLay * -(t_g5 / t_idler);
+  float speedG6 = speedIdler * -(t_idler / t_g6); 
+  
+  float speedMain = 0;
+  if (isClutchEngaged) {
+    if (currentState == 1) speedMain = speedG7;
+    else if (currentState == 2) speedMain = speedG8;
+    else if (currentState == 3) speedMain = speedIn; 
+    else if (currentState == 4) speedMain = speedG6; 
+  }
+  
+  rotIn += speedIn;
+  rotLay += speedLay;
+  rotMain += speedMain;
+  rotG8 += speedG8;
+  rotG7 += speedG7;
+  rotIdler += speedIdler;
+  rotG6 += speedG6;
+  
+  d1_pos = lerp(d1_pos, d1_target, 0.2);
+  d2_pos = lerp(d2_pos, d2_target, 0.2);
+  
+  flowOffset += 0.05; 
+}
+
+void triggerShift() {
+  if (isShifting) return; // Prevent double taps
+  
+  isShifting = true;
+  isClutchEngaged = false;
+  
+  // Predict next state and prepare arrows
+  nextState = (currentState + 1) % gears.length;
+  
+  shiftPhase = 1; // Phase 1: Show arrows
+  shiftTimer = millis();
+}
+
+void handleShifting() {
+  if (isShifting) {
+    // Phase 1: Wait & Preview (Show Blue Arrows for 700ms)
+    if (shiftPhase == 1 && millis() - shiftTimer > 700) {
+      currentState = nextState;
+      d1_target = gears[currentState].t_d1;
+      d2_target = gears[currentState].t_d2;
+      shiftPhase = 2; // Phase 2: Start sliding
+      shiftTimer = millis();
+    } 
+    // Phase 2: Wait for Dog Clutches to Slide (500ms)
+    else if (shiftPhase == 2 && millis() - shiftTimer > 500) {
+      isClutchEngaged = true;
+      isShifting = false;
+      shiftPhase = 0; // Completed
+    }
+  }
+}
+
+// ==========================================
+// 3D RENDERING SYSTEM
+// ==========================================
+void renderViewport3D(float x, float y, float w, float h) {
+  lights();
+  directionalLight(255, 255, 255, 0, 1, -1);
+  ambientLight(90, 95, 105);
+  
+  translate(w / 2, h / 2, -camDist);
+  scale(min(w, h) / 50.0); 
+  rotateX(camAngleX);
+  rotateY(camAngleY);
+  translate(-5, -10, 0);
+
+  // 1. INPUT SHAFT (Clutch Shaft)
+  pushMatrix();
+  translate(-18, 0, 0); rotateX(rotIn); fill(200, 70, 70); drawShaft(16, 1.5);
+  popMatrix();
+  pushMatrix(); translate(-10, 0, 0); rotateX(rotIn); fill(220, 90, 90); drawGear(15, 15*MOD, 2.5); popMatrix();
+
+  // 2. LAY SHAFT (Countershaft)
+  pushMatrix();
+  translate(4, LAY_Y, 0); rotateX(rotLay); fill(70, 130, 200); drawShaft(32, 1.5);
+  pushMatrix(); translate(-14, 0, 0); fill(90, 150, 220); drawGear(30, 30*MOD, 2.5); popMatrix(); 
+  pushMatrix(); translate(-6, 0, 0); fill(90, 150, 220); drawGear(20, 20*MOD, 2.5); popMatrix(); 
+  pushMatrix(); translate(4, 0, 0); fill(90, 150, 220); drawGear(12, 12*MOD, 2.5); popMatrix();  
+  pushMatrix(); translate(14, 0, 0); fill(90, 150, 220); drawGear(12, 12*MOD, 2.5); popMatrix(); 
+  popMatrix();
+
+  // 3. MAIN SPLINE SHAFT (Output)
+  pushMatrix();
+  translate(8, 0, 0); rotateX(rotMain); fill(160, 165, 170); drawShaft(38, 1.2);
+  
+  // Dog Clutch D2
+  pushMatrix(); 
+  translate(d2_pos - 8, 0, 0); 
+  drawDogClutch(); 
+  if (isShifting && shiftPhase == 1) { // Show Preview Arrows
+    float diff2 = gears[nextState].t_d2 - d2_pos;
+    if (abs(diff2) > 0.5) drawBlueArrow3D(diff2, -5.5);
+  }
+  popMatrix();
+  
+  // Dog Clutch D1
+  pushMatrix(); 
+  translate(d1_pos - 8, 0, 0); 
+  drawDogClutch(); 
+  if (isShifting && shiftPhase == 1) { // Show Preview Arrows
+    float diff1 = gears[nextState].t_d1 - d1_pos;
+    if (abs(diff1) > 0.5) drawBlueArrow3D(diff1, -5.5);
+  }
+  popMatrix();
+  popMatrix(); // End Main Shaft
+  
+  // Main Shaft Freewheeling Gears
+  pushMatrix(); translate(-2, 0, 0); rotateX(rotG8); fill(180); drawGear(25, 25*MOD, 2.5); popMatrix(); // G8 (2nd)
+  pushMatrix(); translate(8, 0, 0); rotateX(rotG7); fill(180); drawGear(33, 33*MOD, 2.5); popMatrix(); // G7 (1st)
+  pushMatrix(); translate(18, 0, 0); rotateX(rotG6); fill(180); drawGear(28, 28*MOD, 2.5); popMatrix(); // G6 (Rev)
+
+  // 4. REVERSE IDLER GEAR
+  pushMatrix();
+  translate(18, 15.56, -10.72); 
+  rotateX(rotIdler); fill(120, 190, 130); drawGear(14, 14*MOD, 2.5);
+  popMatrix();
+  
+  // 5. LASER POWER FLOW
+  if (isClutchEngaged) {
+    drawLaserFlow(gears[currentState].flowPath);
+  }
+}
+
+// --- SHAPE & ARROW DRAWING METHODS ---
+
+void drawBlueArrow3D(float diff, float yOffset) {
+  float pulse = (sin(millis() * 0.015) + 1) * 0.5; // Bobbing animation
+  
+  pushMatrix();
+  translate(0, yOffset - pulse, 0); // Y is down, so subtracting moves it UP
+  
+  if (diff < 0) {
+    rotateY(PI); // Flip arrow to point LEFT
+  }
+  
+  noLights(); // Disable lights to make arrow glow neon blue
+  fill(0, 200, 255); 
+  noStroke();
+  
+  // Arrow Stem
+  pushMatrix(); 
+  box(2.5, 0.6, 0.6); 
+  popMatrix();
+  
+  // Arrow Head (Cone)
+  pushMatrix(); 
+  translate(1.25 + 0.75, 0, 0); // Move to tip of the box
+  rotateY(HALF_PI); // Rotate cone to lay flat along X axis
+  drawCone(1.2, 1.5, 12); 
+  popMatrix();
+  
+  lights(); // Re-enable lights for the rest of the scene
+  popMatrix();
+}
+
+void drawCone(float r, float h, int sides) {
+  beginShape(TRIANGLE_FAN);
+  vertex(0, 0, h/2); // Tip
+  for (int i = 0; i <= sides; i++) {
+    float angle = TWO_PI / sides * i;
+    vertex(cos(angle)*r, sin(angle)*r, -h/2); // Base
+  }
+  endShape();
+  
+  beginShape(POLYGON);
+  for (int i = 0; i < sides; i++) {
+    float angle = TWO_PI / sides * i;
+    vertex(cos(angle)*r, sin(angle)*r, -h/2);
+  }
+  endShape(CLOSE);
+}
+
+void drawShaft(float len, float radius) {
+  noStroke(); pushMatrix(); rotateY(HALF_PI); drawCylinder(radius, len, 20); popMatrix();
+}
+
+void drawDogClutch() {
+  fill(255, 200, 0); stroke(80); strokeWeight(0.5);
+  pushMatrix(); rotateY(HALF_PI); drawCylinder(3.5, 2.5, 12); popMatrix(); 
+}
+
+void drawGear(int teeth, float r, float thick) {
+  float innerR = r * 0.82; 
+  int pts = teeth * 2;
+  stroke(50); strokeWeight(0.5);
+  
+  pushMatrix(); rotateY(HALF_PI);
+  beginShape(QUAD_STRIP);
+  for (int i = 0; i <= pts; i++) {
+    float a = (i % pts) * TWO_PI / pts;
+    float currentR = (i % 2 == 0) ? r : innerR; 
+    vertex(cos(a) * currentR, sin(a) * currentR, -thick/2);
+    vertex(cos(a) * currentR, sin(a) * currentR, thick/2);
+  }
+  endShape();
+  
+  noStroke();
+  beginShape(POLYGON); for (int i=0; i<pts; i++) vertex(cos(i*TWO_PI/pts)*((i%2==0)?r:innerR), sin(i*TWO_PI/pts)*((i%2==0)?r:innerR), thick/2); endShape(CLOSE);
+  beginShape(POLYGON); for (int i=0; i<pts; i++) vertex(cos(i*TWO_PI/pts)*((i%2==0)?r:innerR), sin(i*TWO_PI/pts)*((i%2==0)?r:innerR), -thick/2); endShape(CLOSE);
+  popMatrix();
+}
+
+void drawCylinder(float r, float h, int sides) {
+  beginShape(QUAD_STRIP);
+  for (int i = 0; i <= sides; i++) {
+    float angle = TWO_PI / sides * i;
+    vertex(cos(angle)*r, sin(angle)*r, -h/2);
+    vertex(cos(angle)*r, sin(angle)*r, h/2);
+  }
+  endShape();
+  beginShape(POLYGON); for(int i=0; i<sides; i++) vertex(cos(TWO_PI/sides*i)*r, sin(TWO_PI/sides*i)*r, h/2); endShape(CLOSE);
+  beginShape(POLYGON); for(int i=0; i<sides; i++) vertex(cos(TWO_PI/sides*i)*r, sin(TWO_PI/sides*i)*r, -h/2); endShape(CLOSE);
+}
+
+void drawLaserFlow(ArrayList<PVector> path) {
+  if (path == null || path.size() < 2) return;
+  noFill(); stroke(255, 30, 30); strokeWeight(5);
+  beginShape(); for (PVector p : path) vertex(p.x, p.y, p.z); endShape();
+  stroke(255, 100, 100, 100); strokeWeight(10);
+  beginShape(); for (PVector p : path) vertex(p.x, p.y, p.z); endShape();
+  noStroke(); fill(255, 255, 200);
+  float totalLen = 0; float[] dists = new float[path.size()];
+  for (int i = 1; i < path.size(); i++) { totalLen += PVector.dist(path.get(i-1), path.get(i)); dists[i] = totalLen; }
+  for (int dot = 0; dot < 12; dot++) {
+    float targetDist = (flowOffset * 25 + dot * (totalLen / 12.0)) % totalLen;
+    for (int i = 1; i < path.size(); i++) {
+      if (targetDist <= dists[i]) {
+        float amt = (targetDist - dists[i-1]) / (dists[i] - dists[i-1]);
+        PVector p1 = path.get(i-1); PVector p2 = path.get(i);
+        pushMatrix(); translate(lerp(p1.x, p2.x, amt), lerp(p1.y, p2.y, amt), lerp(p1.z, p2.z, amt)); sphere(1.0); popMatrix();
+        break;
+      }
+    }
+  }
+}
+
+// ==========================================
+// 2D DASHBOARD RENDERING
+// ==========================================
+void renderDashboard(float x, float y, float w, float h) {
+  GearState g = gears[currentState];
+  
+  fill(15, 20, 25); noStroke(); rect(x, y, w, h);
+  stroke(60, 70, 80); strokeWeight(4); line(x, y, x + w, y);
+  
+  textAlign(LEFT, TOP);
+  fill(180, 190, 200); textSize(h * 0.08);
+  text("CONSTANT MESH GEARBOX SIMULATION", x + w*0.03, y + h * 0.08);
+  
+  fill(255, 215, 0); textSize(h * 0.16);
+  text(g.name.toUpperCase(), x + w*0.03, y + h * 0.20);
+  
+  fill(0, 255, 204); textSize(h * 0.10);
+  String ratioText = g.ratio == 0 ? "N/A" : nf(abs(g.ratio), 1, 2) + " : 1";
+  text("GEAR RATIO: " + ratioText, x + w*0.03, y + h * 0.42);
+  
+  int outRPM = (isClutchEngaged && g.ratio != 0) ? int(ENGINE_RPM / g.ratio) : 0;
+  fill(255); textSize(h * 0.09);
+  text("ENGINE IN: " + ENGINE_RPM + " RPM", x + w*0.03, y + h * 0.55);
+  if(currentState == 4 && outRPM != 0) fill(255, 100, 100); else fill(100, 255, 100);
+  text("SHAFT OUT: " + outRPM + " RPM " + (currentState==4 ? "(REV)" : ""), x + w*0.03, y + h * 0.67);
+  
+  fill(255, 80, 80); textSize(h * 0.10); text(g.charText, x + w*0.45, y + h * 0.08);
+  fill(180, 220, 255); textSize(h * 0.08); text(g.pathText, x + w*0.45, y + h * 0.22);
+  fill(150, 160, 170); textSize(h * 0.07); textLeading(h * 0.1);
+  text(g.desc, x + w*0.45, y + h * 0.35, w*0.52, h*0.4);
+  
+  // Interactive Button with Shift Phase Status updates
+  float btnW = w * 0.8; float btnH = h * 0.15;
+  float btnX = x + w*0.1; float btnY = y + h * 0.80;
+  
+  if (isClutchEngaged) fill(40, 140, 60); 
+  else if (shiftPhase == 1) fill(0, 150, 255); // Blue for selection
+  else fill(200, 50, 50); // Red for sliding
+  
+  noStroke(); rect(btnX, btnY, btnW, btnH, 15); 
+  
+  fill(255); textAlign(CENTER, CENTER); textSize(h * 0.07);
+  
+  if (isClutchEngaged) {
+    text("TAP ANYWHERE HERE TO SHIFT TO NEXT GEAR", btnX + btnW/2, btnY + btnH/2);
+  } else {
+    if (shiftPhase == 1) text("DISENGAGING CLUTCH & SELECTING GEAR...", btnX + btnW/2, btnY + btnH/2);
+    else text("SLIDING DOG CLUTCHES TO ENGAGE...", btnX + btnW/2, btnY + btnH/2);
+  }
+}
